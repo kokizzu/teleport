@@ -19,6 +19,8 @@ package identityfile
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io/fs"
 	"os"
@@ -70,6 +72,14 @@ const (
 	// configuring a Redis database for mutual TLS.
 	FormatRedis Format = "redis"
 
+	// FormatSnowflake produces public key in the format suitable for
+	// configuration Snowflake JWT access.
+	FormatSnowflake Format = "snowflake"
+
+	// FormatElasticsearch produces CA and key pair in the format suitable for
+	// configuring Elasticsearch for mutual TLS authentication.
+	FormatElasticsearch Format = "elasticsearch"
+
 	// DefaultFormat is what Teleport uses by default
 	DefaultFormat = FormatFile
 )
@@ -79,7 +89,7 @@ type FormatList []Format
 
 // KnownFileFormats is a list of all above formats.
 var KnownFileFormats = FormatList{FormatFile, FormatOpenSSH, FormatTLS, FormatKubernetes, FormatDatabase, FormatMongo,
-	FormatCockroach, FormatRedis}
+	FormatCockroach, FormatRedis, FormatSnowflake, FormatElasticsearch}
 
 // String returns human-readable version of FormatList, ex:
 // file, openssh, tls, kubernetes
@@ -138,6 +148,8 @@ type WriteConfig struct {
 	// KubeProxyAddr is the public address of the proxy with its kubernetes
 	// port. KubeProxyAddr is only used when Format is FormatKubernetes.
 	KubeProxyAddr string
+	// KubeTLSServerName is the SNI host value passed to the server.
+	KubeTLSServerName string
 	// OverwriteDestination forces all existing destination files to be
 	// overwritten. When false, user will be prompted for confirmation of
 	// overwrite first.
@@ -168,7 +180,7 @@ func Write(cfg WriteConfig) (filesWritten []string, err error) {
 		}
 
 		idFile := &identityfile.IdentityFile{
-			PrivateKey: cfg.Key.Priv,
+			PrivateKey: cfg.Key.PrivateKeyPEM(),
 			Certs: identityfile.Certs{
 				SSH: cfg.Key.Cert,
 				TLS: cfg.Key.TLSCert,
@@ -211,12 +223,12 @@ func Write(cfg WriteConfig) (filesWritten []string, err error) {
 			return nil, trace.Wrap(err)
 		}
 
-		err = writer.WriteFile(keyPath, cfg.Key.Priv, identityfile.FilePermissions)
+		err = writer.WriteFile(keyPath, cfg.Key.PrivateKeyPEM(), identityfile.FilePermissions)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
 
-	case FormatTLS, FormatDatabase, FormatCockroach, FormatRedis:
+	case FormatTLS, FormatDatabase, FormatCockroach, FormatRedis, FormatElasticsearch:
 		keyPath := cfg.OutputPath + ".key"
 		certPath := cfg.OutputPath + ".crt"
 		casPath := cfg.OutputPath + ".cas"
@@ -238,7 +250,7 @@ func Write(cfg WriteConfig) (filesWritten []string, err error) {
 			return nil, trace.Wrap(err)
 		}
 
-		err = writer.WriteFile(keyPath, cfg.Key.Priv, identityfile.FilePermissions)
+		err = writer.WriteFile(keyPath, cfg.Key.PrivateKeyPEM(), identityfile.FilePermissions)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -262,7 +274,7 @@ func Write(cfg WriteConfig) (filesWritten []string, err error) {
 		if err := checkOverwrite(writer, cfg.OverwriteDestination, filesWritten...); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		err = writer.WriteFile(certPath, append(cfg.Key.TLSCert, cfg.Key.Priv...), identityfile.FilePermissions)
+		err = writer.WriteFile(certPath, append(cfg.Key.TLSCert, cfg.Key.PrivateKeyPEM()...), identityfile.FilePermissions)
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
@@ -276,7 +288,38 @@ func Write(cfg WriteConfig) (filesWritten []string, err error) {
 		if err != nil {
 			return nil, trace.Wrap(err)
 		}
+	case FormatSnowflake:
+		pubPath := cfg.OutputPath + ".pub"
+		filesWritten = append(filesWritten, pubPath)
 
+		if err := checkOverwrite(writer, cfg.OverwriteDestination, pubPath); err != nil {
+			return nil, trace.Wrap(err)
+		}
+
+		var caCerts []byte
+		for _, ca := range cfg.Key.TrustedCA {
+			for _, cert := range ca.TLSCertificates {
+				block, _ := pem.Decode(cert)
+				cert, err := x509.ParseCertificate(block.Bytes)
+				if err != nil {
+					return nil, trace.Wrap(err)
+				}
+				pubKey, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+				if err != nil {
+					return nil, trace.Wrap(err)
+				}
+				pubPem := pem.EncodeToMemory(&pem.Block{
+					Type:  "PUBLIC KEY",
+					Bytes: pubKey,
+				})
+				caCerts = append(caCerts, pubPem...)
+			}
+		}
+
+		err = os.WriteFile(pubPath, caCerts, identityfile.FilePermissions)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
 	case FormatKubernetes:
 		filesWritten = append(filesWritten, cfg.OutputPath)
 		if err := checkOverwrite(writer, cfg.OverwriteDestination, filesWritten...); err != nil {
@@ -294,6 +337,7 @@ func Write(cfg WriteConfig) (filesWritten []string, err error) {
 			TeleportClusterName: cfg.Key.ClusterName,
 			ClusterAddr:         cfg.KubeProxyAddr,
 			Credentials:         cfg.Key,
+			TLSServerName:       cfg.KubeTLSServerName,
 		}); err != nil {
 			return nil, trace.Wrap(err)
 		}

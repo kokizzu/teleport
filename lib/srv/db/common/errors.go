@@ -17,8 +17,11 @@ limitations under the License.
 package common
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -26,11 +29,11 @@ import (
 	"github.com/gravitational/trace/trail"
 	"github.com/jackc/pgconn"
 	"github.com/jackc/pgerrcode"
-	"github.com/pkg/errors"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/status"
 
 	awslib "github.com/gravitational/teleport/lib/cloud/aws"
+	azurelib "github.com/gravitational/teleport/lib/cloud/azure"
 	"github.com/gravitational/teleport/lib/defaults"
 )
 
@@ -46,8 +49,8 @@ func ConvertError(err error) error {
 	if pgErr, ok := err.(pgError); ok {
 		return ConvertError(pgErr.Unwrap())
 	}
-	if _, ok := err.(causer); ok {
-		return ConvertError(errors.Cause(err))
+	if causer, ok := err.(causer); ok {
+		return ConvertError(causer.Cause())
 	}
 	if _, ok := status.FromError(err); ok {
 		return trail.FromGRPC(err)
@@ -57,6 +60,8 @@ func ConvertError(err error) error {
 		return convertGCPError(e)
 	case awserr.RequestFailure:
 		return awslib.ConvertRequestFailureError(e)
+	case *azcore.ResponseError:
+		return azurelib.ConvertResponseError(e)
 	case *pgconn.PgError:
 		return convertPostgresError(e)
 	case *mysql.MyError:
@@ -118,8 +123,13 @@ func ConvertConnectError(err error, sessionCtx *Session) error {
 
 	err = ConvertError(err)
 
-	if trace.IsAccessDenied(err) && sessionCtx.Database.IsRDS() {
-		return createRDSAccessDeniedError(err, sessionCtx)
+	if trace.IsAccessDenied(err) {
+		switch {
+		case sessionCtx.Database.IsRDS():
+			return createRDSAccessDeniedError(err, sessionCtx)
+		case sessionCtx.Database.IsAzure():
+			return createAzureAccessDeniedError(err, sessionCtx)
+		}
 	}
 
 	return trace.Wrap(err)
@@ -128,6 +138,11 @@ func ConvertConnectError(err error, sessionCtx *Session) error {
 // createRDSAccessDeniedError creates an error with help message to setup IAM
 // auth for RDS.
 func createRDSAccessDeniedError(err error, sessionCtx *Session) error {
+	policy, getPolicyErr := sessionCtx.Database.GetIAMPolicy()
+	if getPolicyErr != nil {
+		policy = fmt.Sprintf("failed to generate IAM policy: %v", getPolicyErr)
+	}
+
 	switch sessionCtx.Database.GetProtocol() {
 	case defaults.ProtocolMySQL:
 		return trace.AccessDenied(`Could not connect to database:
@@ -139,7 +154,7 @@ agent's IAM policy has "rds-connect" permissions (note that IAM changes may
 take a few minutes to propagate):
 
 %v
-`, err, sessionCtx.DatabaseUser, sessionCtx.Database.GetIAMPolicy())
+`, err, sessionCtx.DatabaseUser, policy)
 
 	case defaults.ProtocolPostgres:
 		return trace.AccessDenied(`Could not connect to database:
@@ -151,8 +166,33 @@ agent's IAM policy has "rds-connect" permissions (note that IAM changes may
 take a few minutes to propagate):
 
 %v
-`, err, sessionCtx.DatabaseUser, sessionCtx.Database.GetIAMPolicy())
+`, err, sessionCtx.DatabaseUser, policy)
 
+	default:
+		return trace.Wrap(err)
+	}
+}
+
+// createAzureAccessDeniedError creates an error with help message to setup AAD
+// auth for PostgreSQL/MySQL.
+func createAzureAccessDeniedError(err error, sessionCtx *Session) error {
+	switch sessionCtx.Database.GetProtocol() {
+	case defaults.ProtocolMySQL:
+		return trace.AccessDenied(`Could not connect to database:
+
+  %v
+
+Make sure that Azure Active Directory auth is configured for MySQL user %q and the Teleport database
+agent's service principal. See: https://goteleport.com/docs/database-access/guides/azure-postgres-mysql/
+`, err, sessionCtx.DatabaseUser)
+	case defaults.ProtocolPostgres:
+		return trace.AccessDenied(`Could not connect to database:
+
+  %v
+
+Make sure that Azure Active Directory auth is configured for Postgres user %q and the Teleport database
+agent's service principal. See: https://goteleport.com/docs/database-access/guides/azure-postgres-mysql/
+`, err, sessionCtx.DatabaseUser)
 	default:
 		return trace.Wrap(err)
 	}

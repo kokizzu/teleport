@@ -21,16 +21,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gravitational/teleport/api/client/proto"
-	"github.com/gravitational/teleport/api/types"
-	"github.com/gravitational/teleport/api/utils/sshutils"
-	"github.com/gravitational/teleport/lib/auth/native"
-	"github.com/gravitational/teleport/lib/tlsca"
-	"github.com/gravitational/teleport/lib/utils"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/gravitational/teleport/api/client/proto"
+	"github.com/gravitational/teleport/api/types"
+	"github.com/gravitational/teleport/api/types/wrappers"
+	"github.com/gravitational/teleport/api/utils/sshutils"
+	"github.com/gravitational/teleport/lib/auth/testauthority"
+	"github.com/gravitational/teleport/lib/tlsca"
+	"github.com/gravitational/teleport/lib/utils"
 )
 
 func TestAuth_RegisterUsingToken(t *testing.T) {
@@ -52,14 +54,14 @@ func TestAuth_RegisterUsingToken(t *testing.T) {
 	require.NoError(t, err)
 
 	// create a dynamic token
-	dynamicToken, err := a.GenerateToken(ctx, GenerateTokenRequest{
+	dynamicToken, err := a.GenerateToken(ctx, &proto.GenerateTokenRequest{
 		Roles: types.SystemRoles{types.RoleNode},
-		TTL:   time.Hour,
+		TTL:   proto.Duration(time.Hour),
 	})
 	require.NoError(t, err)
 	require.NotNil(t, dynamicToken)
 
-	sshPrivateKey, sshPublicKey, err := native.GenerateKeyPair()
+	sshPrivateKey, sshPublicKey, err := testauthority.New().GenerateKeyPair()
 	require.NoError(t, err)
 
 	tlsPublicKey, err := PrivateKeyToPublicKeyTLS(sshPrivateKey)
@@ -256,9 +258,10 @@ func TestAuth_RegisterUsingToken(t *testing.T) {
 
 func newBotToken(t *testing.T, tokenName, botName string, role types.SystemRole, expiry time.Time) types.ProvisionToken {
 	t.Helper()
-	token, err := types.NewProvisionTokenFromSpec(tokenName, expiry, types.ProvisionTokenSpecV2{
-		Roles:   []types.SystemRole{role},
-		BotName: botName,
+	token, err := types.NewProvisionTokenFromSpec(tokenName, expiry, types.ProvisionTokenSpecV3{
+		JoinMethod: types.JoinMethodToken,
+		Roles:      []types.SystemRole{role},
+		BotName:    botName,
 	})
 	require.NoError(t, err, "could not create bot token")
 	return token
@@ -277,7 +280,7 @@ func TestRegister_Bot(t *testing.T) {
 	_, err := createBotRole(context.Background(), srv.Auth(), "test", "bot-test", []string{})
 	require.NoError(t, err)
 
-	_, err = createBotUser(context.Background(), srv.Auth(), botName, botResourceName)
+	_, err = createBotUser(context.Background(), srv.Auth(), botName, botResourceName, wrappers.Traits{})
 	require.NoError(t, err)
 
 	later := srv.Clock().Now().Add(4 * time.Hour)
@@ -297,7 +300,7 @@ func TestRegister_Bot(t *testing.T) {
 	err = srv.Auth().UpsertToken(context.Background(), wrongUser)
 	require.NoError(t, err)
 
-	privateKey, publicKey, err := native.GenerateKeyPair()
+	privateKey, publicKey, err := testauthority.New().GenerateKeyPair()
 	require.NoError(t, err)
 	sshPrivateKey, err := ssh.ParseRawPrivateKey(privateKey)
 	require.NoError(t, err)
@@ -341,7 +344,7 @@ func TestRegister_Bot(t *testing.T) {
 				ID: IdentityID{
 					Role: types.RoleBot,
 				},
-				Servers:      []utils.NetAddr{*utils.MustParseAddr(srv.Addr().String())},
+				AuthServers:  []utils.NetAddr{*utils.MustParseAddr(srv.Addr().String())},
 				PublicTLSKey: tlsPublicKey,
 				PublicSSHKey: publicKey,
 			})
